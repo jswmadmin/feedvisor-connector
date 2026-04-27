@@ -1,0 +1,4 @@
+mcp[cli]
+requests
+python-dotenv
+uvicorn[standard]

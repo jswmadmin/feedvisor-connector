@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "feedvisor": {
+      "command": "python",
+      "args": ["C:\\PATH\\TO\\feedvisor_connector\\server.py"]
+    }
+  }
+}
