@@ -30,6 +30,7 @@ import requests
 from typing import Optional
 from dotenv import load_dotenv
 from mcp.server.fastmcp import FastMCP
+from mcp.server.sse import TransportSecuritySettings
 
 load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), ".env"))
 
@@ -104,7 +105,10 @@ BASE_URL = "https://api-gateway.feedvisor.com"
 
 _token_cache: dict[str, dict] = {}
 
-mcp = FastMCP("Feedvisor")
+# Disable MCP's built-in DNS rebinding protection — our _APIKeyAuth
+# middleware handles authentication instead via Bearer token.
+_security = TransportSecuritySettings(enable_dns_rebinding_protection=False)
+mcp = FastMCP("Feedvisor", transport_security=_security)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
