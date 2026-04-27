@@ -812,7 +812,7 @@ if __name__ == "__main__":
         port    = int(os.getenv("PORT", 8000))
         api_key = os.getenv("MCP_API_KEY", "")
 
-        app = mcp.sse_app()
+        app = mcp.streamable_http_app()
 
         if api_key:
             app = _APIKeyAuth(app, api_key)
