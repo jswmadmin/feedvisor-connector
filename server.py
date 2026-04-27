@@ -722,17 +722,28 @@ def request_analytics_report(
 # ──────────────────────────────────────────────────────────────────────────────
 
 @mcp.tool()
-def get_report_status(account_name: str, request_id: str) -> str:
+def get_report_status(
+    account_name: str,
+    request_id: str,
+    auto_download: bool = True,
+    sort_by: str = "Operating Profit After Returns",
+    top_n: int = 10,
+) -> str:
     """
-    Check the status of a previously requested report and get its download URL
-    when ready.
+    Check the status of a previously requested report.
+
+    When the report is Finished and auto_download=True (default), automatically
+    downloads and returns the top N products ranked by sort_by — so you don't
+    need a separate tool call.
 
     Parameters:
-    - account_name : The same account used when requesting the report
-    - request_id   : The requestId returned by request_configuration_report()
-                     or request_analytics_report()
-
-    Returns the current status and a download URL when the report is complete.
+    - account_name  : The same account used when requesting the report
+    - request_id    : The requestId returned by request_analytics_report() or
+                      request_configuration_report()
+    - auto_download : If True (default), download and parse the file when Finished
+    - sort_by       : Column to rank by when auto_download=True
+                      Default: 'Operating Profit After Returns'
+    - top_n         : How many top products to return (default 10)
     """
     err = _validate_account(account_name)
     if err:
@@ -741,7 +752,14 @@ def get_report_status(account_name: str, request_id: str) -> str:
     account_id = ACCOUNTS[account_name]["account_id"]
     try:
         result = _api_get(account_name, f"/external/{account_id}/report/{request_id}")
-        return json.dumps(result, indent=2)
+        status = result.get("status", "")
+
+        if status != "Finished" or not auto_download:
+            return json.dumps(result, indent=2)
+
+        # Report is done — auto-download and parse
+        return get_analytics_top_products(account_name, str(request_id), sort_by=sort_by, top_n=top_n)
+
     except requests.HTTPError as e:
         return f"API error {e.response.status_code}: {e.response.text}"
     except Exception as e:
