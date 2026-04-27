@@ -767,11 +767,21 @@ class _APIKeyAuth:
                 await send({"type": "http.response.body", "body": b"ok"})
                 return
 
-            # Enforce Bearer token when a key is configured
+            # Enforce API key when configured.
+            # Accepts key via:
+            #   1. Authorization: Bearer <key>   (Claude Desktop / curl)
+            #   2. ?key=<key> query param        (Anthropic remote connector URL)
             if self.api_key:
+                import urllib.parse
                 headers = {k.lower(): v for k, v in scope.get("headers", [])}
                 auth = headers.get(b"authorization", b"").decode("utf-8", errors="ignore")
-                if not (auth.startswith("Bearer ") and auth[7:] == self.api_key):
+                bearer_ok = auth.startswith("Bearer ") and auth[7:] == self.api_key
+
+                qs = scope.get("query_string", b"").decode("utf-8", errors="ignore")
+                params = dict(urllib.parse.parse_qsl(qs))
+                query_ok = params.get("key") == self.api_key
+
+                if not (bearer_ok or query_ok):
                     await send({
                         "type": "http.response.start",
                         "status": 401,
@@ -779,7 +789,7 @@ class _APIKeyAuth:
                     })
                     await send({
                         "type": "http.response.body",
-                        "body": b'{"error":"Unauthorized","message":"Supply a valid key via: Authorization: Bearer <MCP_API_KEY>"}',
+                        "body": b'{"error":"Unauthorized","message":"Supply key via Authorization: Bearer <key> or ?key=<key>"}',
                     })
                     return
 
@@ -788,24 +798,4 @@ class _APIKeyAuth:
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Entry point — dual-mode: stdio (Claude Desktop) or HTTP (Railway / remote)
-# ──────────────────────────────────────────────────────────────────────────────
-if __name__ == "__main__":
-    transport = os.getenv("MCP_TRANSPORT", "streamable-http")
-
-    if transport == "stdio":
-        # ── Local Claude Desktop mode (original behaviour) ──────────────────
-        mcp.run()
-    else:
-        # ── Remote mode: Railway / cloud ────────────────────────────────────
-        import uvicorn
-
-        port    = int(os.getenv("PORT", 8000))
-        api_key = os.getenv("MCP_API_KEY", "")
-
-        app = mcp.sse_app()
-
-        if api_key:
-            app = _APIKeyAuth(app, api_key)
-
-        uvicorn.run(app, host="0.0.0.0", port=port, log_level="info",
-                    proxy_headers=True, forwarded_allow_ips="*")
+# ─────────────────────────────────────────────────────────────────�
