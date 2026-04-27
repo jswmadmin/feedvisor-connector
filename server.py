@@ -653,7 +653,8 @@ def request_configuration_report(
 @mcp.tool()
 def request_analytics_report(
     account_name: str,
-    file_type: str = "XLSX",
+    days_back: int = 30,
+    file_type: str = "CSV",
     fulfillment_channel: str = None,
     in_stock: bool = None,
     has_buy_box: bool = None,
@@ -666,20 +667,29 @@ def request_analytics_report(
 
     Parameters:
     - account_name        : Account to pull from (Amazon accounts only)
-    - file_type           : 'XLSX' (default) or 'CSV'
+    - days_back           : How many days of data to pull (default 30)
+    - file_type           : 'CSV' (default) or 'XLSX'
     - fulfillment_channel : 'FBA' or 'FBM' (omit for all)
     - in_stock            : true/false
     - has_buy_box         : true/false
     - active              : true/false
     - search              : Search in product name, ASIN, or SKU
     """
+    import datetime
     err = _validate_account(account_name)
     if err:
         return f"Error: {err}"
 
     account_id = ACCOUNTS[account_name]["account_id"]
+    end_date   = datetime.date.today()
+    start_date = end_date - datetime.timedelta(days=days_back)
 
-    payload: dict = {"fileType": file_type}
+    payload: dict = {
+        "accounts":       [account_id],
+        "startDate":      str(start_date),
+        "endDate":        str(end_date),
+        "comparisonType": "PERIOD",
+    }
     if fulfillment_channel:    payload["fulfillmentChannel"] = fulfillment_channel.upper()
     if in_stock is not None:   payload["inStock"]            = in_stock
     if has_buy_box is not None: payload["hasBB"]             = has_buy_box
@@ -687,13 +697,14 @@ def request_analytics_report(
     if search:                 payload["search"]             = search
 
     try:
-        result = _api_post(account_name, f"/external/{account_id}/analytics/report", payload)
+        result = _api_post(account_name, f"/external/report/product?fileType={file_type}", payload)
         request_id = result.get("requestId")
         return json.dumps({
-            "status":    "analytics_report_requested",
-            "account":   account_name,
-            "requestId": request_id,
-            "next_step": f"Call get_report_status(account_name='{account_name}', request_id='{request_id}') to check when your report is ready.",
+            "status":     "analytics_report_requested",
+            "account":    account_name,
+            "requestId":  request_id,
+            "date_range": f"{start_date} to {end_date}",
+            "next_step":  f"Call get_report_status(account_name='{account_name}', request_id='{request_id}') to poll until status=DONE, then get_report_download() for the file.",
         }, indent=2)
     except requests.HTTPError as e:
         return f"API error {e.response.status_code}: {e.response.text}"
@@ -726,6 +737,98 @@ def get_report_status(account_name: str, request_id: str) -> str:
     try:
         result = _api_get(account_name, f"/external/{account_id}/report/{request_id}")
         return json.dumps(result, indent=2)
+    except requests.HTTPError as e:
+        return f"API error {e.response.status_code}: {e.response.text}"
+    except Exception as e:
+        return f"Error: {e}"
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# TOOL: get_analytics_top_products
+# ──────────────────────────────────────────────────────────────────────────────
+
+@mcp.tool()
+def get_analytics_top_products(
+    account_name: str,
+    request_id: str,
+    sort_by: str = "Operating Profit After Returns",
+    top_n: int = 10,
+) -> str:
+    """
+    Download a completed analytics report and return the top N products
+    ranked by a chosen metric.
+
+    Parameters:
+    - account_name : Same account used when requesting the report
+    - request_id   : requestId from request_analytics_report()
+    - sort_by      : Column to rank by (default: 'Operating Profit After Returns')
+                     Other useful options: 'Revenue', 'Units Sold', 'Net Profit'
+    - top_n        : How many top products to return (default 10)
+
+    Call get_report_status() first to confirm status == 'DONE'.
+    """
+    import io, zipfile, csv as csv_mod
+    err = _validate_account(account_name)
+    if err:
+        return f"Error: {err}"
+
+    account_id = ACCOUNTS[account_name]["account_id"]
+    try:
+        # Get pre-signed download URL
+        dl = _api_get(account_name, f"/external/{account_id}/report/{request_id}/file")
+        url = dl.get("url") or dl.get("downloadUrl") or (list(dl.values())[0] if dl else None)
+        if not url:
+            return f"No download URL in response: {dl}"
+
+        # Download ZIP
+        zdata = requests.get(url, timeout=60).content
+        zf = zipfile.ZipFile(io.BytesIO(zdata))
+        csv_name = next((n for n in zf.namelist() if n.endswith(".csv")), None)
+        if not csv_name:
+            return f"No CSV found in ZIP. Files: {zf.namelist()}"
+
+        rows = list(csv_mod.DictReader(io.TextIOWrapper(zf.open(csv_name), encoding="utf-8-sig")))
+        if not rows:
+            return "Report is empty."
+
+        # Find sort column (case-insensitive partial match)
+        cols = list(rows[0].keys())
+        matched_col = next((c for c in cols if sort_by.lower() in c.lower()), None)
+        if not matched_col:
+            return f"Column '{sort_by}' not found. Available: {cols}"
+
+        def parse_num(v):
+            try:
+                return float(str(v).replace(",", "").replace("$", "").replace("%", "").strip() or 0)
+            except Exception:
+                return 0.0
+
+        sorted_rows = sorted(rows, key=lambda r: parse_num(r.get(matched_col, 0)), reverse=True)
+        top = sorted_rows[:top_n]
+
+        key_cols = ["SKU", "ASIN", "Product Name", "Brand",
+                    matched_col, "Revenue", "Units Sold", "Operating Profit After Returns",
+                    "Net Profit", "Return Rate"]
+        display_cols = [c for c in key_cols if any(kc.lower() in c.lower() for kc in key_cols for c in cols if kc.lower() == c.lower())]
+        # Simpler: just keep columns that exist
+        display_cols = [c for c in cols if any(k.lower() in c.lower() for k in
+                        ["SKU","ASIN","Product Name","Brand", sort_by,"Revenue","Units Sold","Profit","Return Rate"])]
+        display_cols = display_cols or cols[:8]
+
+        summary = []
+        for i, row in enumerate(top, 1):
+            entry = {"rank": i}
+            for c in display_cols:
+                entry[c] = row.get(c, "")
+            summary.append(entry)
+
+        return json.dumps({
+            "account":      account_name,
+            "sorted_by":    matched_col,
+            "total_skus":   len(rows),
+            "top_products": summary,
+        }, indent=2)
+
     except requests.HTTPError as e:
         return f"API error {e.response.status_code}: {e.response.text}"
     except Exception as e:
