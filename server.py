@@ -798,9 +798,10 @@ if __name__ == "__main__":
         port    = int(os.getenv("PORT", 8000))
         api_key = os.getenv("MCP_API_KEY", "")
 
-        app = mcp.streamable_http_app()
+        app = mcp.sse_app()
 
         if api_key:
             app = _APIKeyAuth(app, api_key)
 
-        uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")
+        uvicorn.run(app, host="0.0.0.0", port=port, log_level="info",
+                    proxy_headers=True, forwarded_allow_ips="*")
