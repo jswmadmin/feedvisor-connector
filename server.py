@@ -738,18 +738,40 @@ def get_report_status(account_name: str, request_id: str) -> str:
 
 class _APIKeyAuth:
     """
-    Pure ASGI middleware that enforces Authorization: Bearer <MCP_API_KEY>.
+    Pure ASGI middleware that enforces an API key for all MCP endpoints.
 
-    • If MCP_API_KEY env var is empty/unset, auth is skipped (local dev mode).
-    • GET /health is always allowed — used by Railway's health-check system.
+    Auth is accepted via:
+      1. Authorization: Bearer <key>  header
+      2. ?key=<key>                   query param (embedded in connector URL)
+      3. Authenticated session ID     (SSE: tracks session after key auth on /sse)
+
+    Special paths that bypass auth:
+      • /health              — Railway health-check
+      • /.well-known/*       — OAuth/MCP discovery (returns 404 naturally)
+
+    If MCP_API_KEY is empty, auth is disabled entirely (local dev).
     """
 
     def __init__(self, app, api_key: str):
         self.app = app
         self.api_key = api_key
+        self._authed_sessions: set[str] = set()   # session IDs from authenticated SSE connections
+
+    def _parse_auth(self, scope) -> tuple[bool, str | None]:
+        """Return (passes_key_auth, session_id_from_qs)."""
+        import urllib.parse
+        headers = {k.lower(): v for k, v in scope.get("headers", [])}
+        auth = headers.get(b"authorization", b"").decode("utf-8", errors="ignore")
+        bearer_ok = auth.startswith("Bearer ") and auth[7:] == self.api_key
+
+        qs = scope.get("query_string", b"").decode("utf-8", errors="ignore")
+        params = dict(urllib.parse.parse_qsl(qs))
+        query_ok = params.get("key") == self.api_key
+        session_id = params.get("session_id") or None
+
+        return (bearer_ok or query_ok), session_id
 
     async def __call__(self, scope, receive, send):
-        # Let lifespan events pass through untouched
         if scope["type"] == "lifespan":
             await self.app(scope, receive, send)
             return
@@ -757,41 +779,73 @@ class _APIKeyAuth:
         if scope["type"] == "http":
             path = scope.get("path", "")
 
-            # Railway health-check endpoint — no auth required
+            # ── Always-public paths ──────────────────────────────────────────
             if path == "/health":
-                await send({
-                    "type": "http.response.start",
-                    "status": 200,
-                    "headers": [(b"content-type", b"text/plain")],
-                })
+                await send({"type": "http.response.start", "status": 200,
+                            "headers": [(b"content-type", b"text/plain")]})
                 await send({"type": "http.response.body", "body": b"ok"})
                 return
 
-            # Enforce API key when configured.
-            # Accepts key via:
-            #   1. Authorization: Bearer <key>   (Claude Desktop / curl)
-            #   2. ?key=<key> query param        (Anthropic remote connector URL)
+            # OAuth / MCP discovery — let through so clients get a natural 404
+            # rather than a 401 that makes them think OAuth is required.
+            if path.startswith("/.well-known/"):
+                await self.app(scope, receive, send)
+                return
+
+            # ── Enforce key when configured ──────────────────────────────────
             if self.api_key:
-                import urllib.parse
-                headers = {k.lower(): v for k, v in scope.get("headers", [])}
-                auth = headers.get(b"authorization", b"").decode("utf-8", errors="ignore")
-                bearer_ok = auth.startswith("Bearer ") and auth[7:] == self.api_key
+                key_ok, session_id = self._parse_auth(scope)
 
-                qs = scope.get("query_string", b"").decode("utf-8", errors="ignore")
-                params = dict(urllib.parse.parse_qsl(qs))
-                query_ok = params.get("key") == self.api_key
+                # Also allow requests whose session was previously authenticated
+                session_ok = bool(session_id and session_id in self._authed_sessions)
 
-                if not (bearer_ok or query_ok):
-                    await send({
-                        "type": "http.response.start",
-                        "status": 401,
-                        "headers": [(b"content-type", b"application/json")],
-                    })
-                    await send({
-                        "type": "http.response.body",
-                        "body": b'{"error":"Unauthorized","message":"Supply key via Authorization: Bearer <key> or ?key=<key>"}',
-                    })
+                if not (key_ok or session_ok):
+                    await send({"type": "http.response.start", "status": 401,
+                                "headers": [(b"content-type", b"application/json")]})
+                    await send({"type": "http.response.body",
+                                "body": b'{"error":"Unauthorized","message":"Supply key via Authorization: Bearer <key> or ?key=<key>"}'})
                     return
+
+                # When a key-authenticated request comes in on the SSE endpoint,
+                # wrap `send` to capture the session ID from the endpoint event
+                # so that follow-up /messages/ calls (which carry no key) are allowed.
+                if key_ok and path in ("/sse", "/mcp"):
+                    authed = self._authed_sessions
+                    _orig_send = send
+
+                    async def _tracking_send(event):
+                        if event["type"] == "http.response.body":
+                            import urllib.parse
+                            body = event.get("body", b"").decode("utf-8", errors="ignore")
+                            for line in body.splitlines():
+                                # SSE endpoint line: "data: /messages/?session_id=xxx"
+                                if line.startswith("data: ") and "session_id=" in line:
+                                    data_url = line[6:].strip()
+                                    parsed = urllib.parse.urlparse(data_url)
+                                    sid = dict(urllib.parse.parse_qsl(parsed.query)).get("session_id")
+                                    if sid:
+                                        authed.add(sid)
+                                # Streamable HTTP Mcp-Session-Id comes through headers, handled below
+                        await _orig_send(event)
+
+                    send = _tracking_send
+
+                # For streamable HTTP, the session ID is in the *response* header.
+                # Wrap send to capture it from the start event.
+                if key_ok and path == "/mcp":
+                    authed = self._authed_sessions
+                    _orig_send2 = send
+
+                    async def _header_tracking_send(event):
+                        if event["type"] == "http.response.start":
+                            hdrs = {k.lower(): v.decode("utf-8", errors="ignore")
+                                    for k, v in event.get("headers", [])}
+                            sid = hdrs.get("mcp-session-id")
+                            if sid:
+                                authed.add(sid)
+                        await _orig_send2(event)
+
+                    send = _header_tracking_send
 
         await self.app(scope, receive, send)
 
