@@ -698,13 +698,18 @@ def request_analytics_report(
 
     try:
         result = _api_post(account_name, f"/external/report/product?fileType={file_type}", payload)
-        request_id = result.get("requestId")
+        # API may return requestId under various key names
+        request_id = (result.get("requestId") or result.get("id") or
+                      result.get("reportId") or result.get("request_id"))
+        if not request_id:
+            return json.dumps({"raw_api_response": result,
+                               "note": "Could not find requestId — inspect raw_api_response for the correct key"}, indent=2)
         return json.dumps({
             "status":     "analytics_report_requested",
             "account":    account_name,
             "requestId":  request_id,
             "date_range": f"{start_date} to {end_date}",
-            "next_step":  f"Call get_report_status(account_name='{account_name}', request_id='{request_id}') to poll until status=DONE, then get_report_download() for the file.",
+            "next_step":  f"Call get_report_status(account_name='{account_name}', request_id='{request_id}') to poll until status=DONE, then get_analytics_top_products() for results.",
         }, indent=2)
     except requests.HTTPError as e:
         return f"API error {e.response.status_code}: {e.response.text}"
